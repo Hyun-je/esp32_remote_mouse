@@ -4,10 +4,11 @@ import os
 import tempfile
 import threading
 from unittest.mock import patch
-from app import App, content_rect, load_settings, normalized, save_settings, touchpad_vertical_delta
+from app import (App, MEDIA_ACTIONS, wheel_detent, content_rect, load_settings, normalized, save_settings,
+                 touchpad_horizontal_delta, touchpad_vertical_delta)
 from keymap import KeyState, usage_from_event, usage_from_keycode
 from types import SimpleNamespace
-from transport import LinkLog, SerialTransport
+from transport import LinkLog, SerialTransport, parse_hires, parse_peer, peer_label
 from video_capture import CaptureDevice, list_frame_rates, list_resolutions
 
 class CoreTests(unittest.TestCase):
@@ -22,6 +23,118 @@ class CoreTests(unittest.TestCase):
         app.link = object()
         App.recover_bluetooth(app)
         self.assertEqual(sent, ['ble_recover'])
+
+    def test_peer_line_parsing_and_label(self):
+        peer = parse_peer('PEER name="재현의 iPad" manufacturer="Apple Inc." model="iPad13,4"')
+        self.assertEqual(peer, {'name': '재현의 iPad', 'manufacturer': 'Apple Inc.', 'model': 'iPad13,4'})
+        self.assertEqual(peer_label(peer), '재현의 iPad (iPad13,4)')
+        self.assertEqual(peer_label(parse_peer('PEER name="LAPTOP-1" manufacturer="" model=""')), 'LAPTOP-1')
+        self.assertEqual(peer_label(parse_peer('PEER name="" manufacturer="Apple Inc." model=""')), 'Apple Inc.')
+        self.assertIsNone(parse_peer('PEER unknown'))
+        self.assertIsNone(parse_peer('PEER name="" manufacturer="" model=""'))
+
+    def test_hires_status_parsing_and_text(self):
+        self.assertEqual(parse_hires('CONNECTED sleeping=0 wheel_hires=1 pan_hires=0'), (True, False))
+        self.assertIsNone(parse_hires('CONNECTED sleeping=0 mouse_subscribers=1'))
+        texts = []
+        app = SimpleNamespace(link=None, ble=False, hires=None, hires_status=SimpleNamespace(set=texts.append))
+        App.update_hires_status(app)
+        app.link = object()
+        App.update_hires_status(app)
+        app.ble = True
+        App.update_hires_status(app)
+        app.hires = (True, False)
+        App.update_hires_status(app)
+        self.assertEqual(texts, ['고해상도 휠: USB 연결 후 확인', '고해상도 휠: 대상 연결 후 확인',
+                                 '고해상도 휠: 펌웨어가 지원하지 않음',
+                                 '고해상도 휠: 세로 켜짐 · 가로 꺼짐 (한 칸 단위)'])
+
+    def test_ble_connect_requests_peer_and_shows_name(self):
+        import queue
+        sent, statuses, titles = [], [], []
+        app = SimpleNamespace(events=queue.Queue(), link=object(), ble=False, peer=None, sleeping=False,
+                              send=sent.append, reset_input=lambda: None, check_idle=lambda: None, poll=None,
+                              status=SimpleNamespace(set=statuses.append),
+                              root=SimpleNamespace(title=titles.append, after=lambda *a: None))
+        app.set_peer = lambda peer: App.set_peer(app, peer)
+        app.update_hires_status = lambda: None
+        app.connected_status = lambda: App.connected_status(app)
+        app.events.put((app.link, 'ble', True))
+        app.events.put((app.link, 'ble', True))
+        app.events.put((app.link, 'peer', {'name': 'LAPTOP-1', 'manufacturer': '', 'model': ''}))
+        App.poll(app)
+        self.assertEqual(sent, ['peer'])
+        self.assertEqual(statuses[-1], '연결됨: LAPTOP-1')
+        self.assertEqual(titles[-1], 'ESP32 Remote Input — LAPTOP-1')
+        app.events.put((app.link, 'ble', False))
+        App.poll(app)
+        self.assertIsNone(app.peer)
+        self.assertEqual(titles[-1], 'ESP32 Remote Input')
+
+    def scroll_app(self, sent):
+        app = SimpleNamespace(scroll_remainder=[0.0, 0.0], send=sent.append, note_activity=lambda: None,
+                              is_inside=lambda x, y: True, controlling=lambda: True, active=lambda: True)
+        app.scroll = lambda event, units, axis=0: App.scroll(app, event, units, axis)
+        app.accumulate_scroll = lambda *args: App.accumulate_scroll(app, *args)
+        return app
+
+    def test_scroll_sends_eighth_detent_units_and_splits_large_amounts(self):
+        sent = []
+        app = self.scroll_app(sent)
+        event = SimpleNamespace(x=0, y=0)
+        App.scroll(app, event, 8)
+        App.scroll(app, event, -3, 1)
+        App.scroll(app, event, 1100)
+        self.assertEqual(sent, ['smooth 0 1 8', 'smooth 1 0 3', 'smooth 0 1 1016', 'smooth 0 1 84'])
+
+    def test_detent_wheel_keeps_fractional_deltas_and_shift_scrolls_left(self):
+        sent = []
+        app = self.scroll_app(sent)
+        app.wheel_detent = 120
+        App.mouse_wheel(app, SimpleNamespace(x=0, y=0, delta=120))
+        App.mouse_wheel(app, SimpleNamespace(x=0, y=0, delta=10))
+        App.mouse_wheel(app, SimpleNamespace(x=0, y=0, delta=10))
+        App.mouse_wheel(app, SimpleNamespace(x=0, y=0, delta=120), 1)
+        self.assertEqual(sent, ['smooth 0 1 8', 'smooth 0 1 1', 'smooth 1 0 8'])
+
+    def test_wheel_detent_by_platform_and_tk_version(self):
+        self.assertEqual(wheel_detent('win32', '8.6.13'), 120)
+        self.assertEqual(wheel_detent('linux', '9.0.1'), 120)
+        self.assertIsNone(wheel_detent('darwin', '8.6.12'))
+        sent = []
+        app = self.scroll_app(sent)
+        app.wheel_detent = None
+        App.mouse_wheel(app, SimpleNamespace(x=0, y=0, delta=-2))
+        self.assertEqual(sent, ['smooth 0 0 16'])
+
+    def test_touchpad_scroll_uses_both_axes(self):
+        sent = []
+        app = self.scroll_app(sent)
+        App.touchpad_scroll(app, SimpleNamespace(x=0, y=0, delta=(30 << 16) | (0x10000 - 15)))
+        self.assertEqual(sent, ['smooth 0 1 4', 'smooth 1 1 8'])
+
+    def test_extra_mouse_buttons_ignore_alternate_click(self):
+        sent = []
+        app = SimpleNamespace(inside=False, dragging=False, rect=(0, 0, 100, 100), link=object(),
+                              send=sent.append, note_activity=lambda: None, has_focus=lambda: True,
+                              active=lambda: True, is_inside=lambda x, y: True,
+                              canvas=SimpleNamespace(focus_set=lambda: None),
+                              alternate_click=SimpleNamespace(get=lambda: True))
+        event = SimpleNamespace(x=50, y=50)
+        App.mouse_down(app, event, 6)
+        self.assertEqual(sent[-1], 'down 5051 5051 6')
+        app.dragging = False
+        App.mouse_down(app, event, 2)
+        self.assertEqual(sent[-1], 'down 5051 5051 4')
+
+    def test_media_menu_actions_are_valid_firmware_commands(self):
+        for action in filter(None, MEDIA_ACTIONS):
+            _label, command, usage = action
+            if command == 'media':
+                self.assertTrue(1 <= usage <= 0x3ff)
+            else:
+                self.assertEqual(command, 'system')
+                self.assertTrue(0x81 <= usage <= 0x83)
 
     def idle_app(self, sent):
         app = SimpleNamespace(link=object(), sleeping=False, idle_minutes=1, last_activity=0.0,
@@ -58,6 +171,7 @@ class CoreTests(unittest.TestCase):
         app.sleeping, app.ble = True, False
         app.root = SimpleNamespace(after_idle=lambda callback: None)
         app.canvas = SimpleNamespace(focus_set=lambda: None)
+        app.target_command = lambda command: App.target_command(app, command)
         App.system_action(app, 11, 8)
         self.assertEqual(sent, ['wake'])
 
@@ -101,8 +215,11 @@ class CoreTests(unittest.TestCase):
             link=object(), ble=True, inside=False, note_activity=lambda: None,
             reset_input=lambda: sent.append('reset'), send=sent.append,
         )
+        app.target_command = lambda command: App.target_command(app, command)
         App.system_action(app, 43, 8)
         self.assertEqual(sent, ['reset', 'shortcut 8 43'])
+        App.target_command(app, 'media 233')
+        self.assertEqual(sent[-2:], ['reset', 'media 233'])
 
     def test_letterbox_and_coordinate_mapping(self):
         rect = content_rect(1000, 1000, 1600, 900)
@@ -162,6 +279,8 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(touchpad_vertical_delta((42 << 16) | 7), 7)
         self.assertEqual(touchpad_vertical_delta((42 << 16) | 0xfff9), -7)
         self.assertEqual(touchpad_vertical_delta(42 << 16), 0)
+        self.assertEqual(touchpad_horizontal_delta((42 << 16) | 0xfff9), 42)
+        self.assertEqual(touchpad_horizontal_delta((0xffd6 << 16) | 7), -42)
 
 if __name__ == '__main__':
     unittest.main()

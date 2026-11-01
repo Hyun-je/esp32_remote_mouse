@@ -12,7 +12,7 @@ from tkinter import ttk, messagebox
 
 from keymap import KeyState, usage_from_event
 from mac_shortcuts import MacHideShortcut
-from transport import SerialTransport
+from transport import SerialTransport, peer_label
 from video_capture import CaptureError, VideoCapture, list_devices, list_resolutions, list_frame_rates
 
 DEFAULT_IDLE_MINUTES = 5
@@ -72,10 +72,48 @@ def save_settings(changes, path=None):
         return False
 
 
+def signed16(value):
+    value &= 0xffff
+    return value - 0x10000 if value & 0x8000 else value
+
+
 def touchpad_vertical_delta(packed):
     """Tk packs signed X and Y deltas into the high and low 16 bits."""
-    value = int(packed) & 0xffff
-    return value - 0x10000 if value & 0x8000 else value
+    return signed16(int(packed))
+
+
+def touchpad_horizontal_delta(packed):
+    return signed16(int(packed) >> 16)
+
+
+# The firmware scrolls in 1/8-detent units and sends whole detents to hosts without high-resolution wheels.
+SCROLL_UNITS = 8
+MAX_SCROLL_UNITS = 127 * SCROLL_UNITS
+# Trackpad pixels and Windows wheel deltas per detent.
+TOUCHPAD_DETENT = 30
+WINDOWS_DETENT = 120
+
+
+def wheel_detent(platform, tk_patchlevel):
+    """MouseWheel delta per detent, or None when Tk reports whole detents (Tk 8.6 on macOS/X11)."""
+    major_minor = tuple(int(part) for part in tk_patchlevel.split('.')[:2])
+    return WINDOWS_DETENT if platform == 'win32' or major_minor >= (8, 7) else None
+
+
+# Firmware button numbers for middle, back and forward (relative report).
+MIDDLE_BUTTON, BACK_BUTTON, FORWARD_BUTTON = 5, 6, 7
+# HID Consumer page usages and System Control usages offered in the media menu.
+MEDIA_ACTIONS = (
+    ('재생/일시정지', 'media', 0xcd), ('이전 트랙', 'media', 0xb6), ('다음 트랙', 'media', 0xb5),
+    None,
+    ('음소거', 'media', 0xe2), ('볼륨 낮추기', 'media', 0xea), ('볼륨 높이기', 'media', 0xe9),
+    None,
+    ('밝기 낮추기', 'media', 0x70), ('밝기 높이기', 'media', 0x6f),
+    None,
+    ('홈 (Android)', 'media', 0x223), ('뒤로 (Android)', 'media', 0x224),
+    None,
+    ('시스템 절전', 'system', 0x82),
+)
 
 
 class App:
@@ -87,11 +125,16 @@ class App:
         self.events = queue.Queue()
         self.link = None
         self.ble = False
+        self.peer = None
+        self.hires = None
+        self.hires_status = tk.StringVar()
         self.link_error = None
         self.inside = False
         self.dragging = False
         self.drag_button = None
-        self.scroll_remainder = 0
+        self.scroll_remainder = [0.0, 0.0]
+        # Tk 8.7+ reports wheel deltas in multiples of 120 on every platform.
+        self.wheel_detent = wheel_detent(sys.platform, root.tk.call('info', 'patchlevel'))
         self.language_key_down = False
         self.home_key_down = False
         self.mac_hide = MacHideShortcut()
@@ -152,6 +195,16 @@ class App:
         ttk.Button(bar, text='Spotlight', command=lambda: self.system_action(44, 8)).pack(side='left', padx=(6, 0))
         ttk.Button(bar, text='Dock', command=lambda: self.system_action(7, 12)).pack(side='left', padx=(6, 0))
         ttk.Button(bar, text='앱 창 보기', command=self.expose).pack(side='left', padx=(6, 0))
+        media = ttk.Menubutton(bar, text='미디어')
+        media_menu = tk.Menu(media, tearoff=False)
+        for action in MEDIA_ACTIONS:
+            if action is None:
+                media_menu.add_separator()
+            else:
+                label, command, usage = action
+                media_menu.add_command(label=label, command=lambda c=command, u=usage: self.target_command(f'{c} {u}'))
+        media['menu'] = media_menu
+        media.pack(side='left', padx=(6, 0))
         self.fullscreen_button = ttk.Button(bar, text='전체 화면', command=self.toggle_fullscreen)
         self.fullscreen_button.pack(side='left', padx=(6, 0))
         ttk.Button(bar, text='설정', command=self.open_settings).pack(side='right')
@@ -170,14 +223,36 @@ class App:
         self.canvas.bind(f'<ButtonPress-{right_button}>', lambda event: self.mouse_down(event, 2))
         self.canvas.bind(f'<B{right_button}-Motion>', self.mouse_drag)
         self.canvas.bind(f'<ButtonRelease-{right_button}>', lambda event: self.mouse_up(event, 2))
+        middle_button = 3 if sys.platform == 'darwin' else 2
+        extra_buttons = [(middle_button, MIDDLE_BUTTON)]
+        # Tk 8.6 on X11 uses buttons 4-7 for wheels and 8/9 for back/forward; elsewhere, and
+        # on X11 since Tk 8.7, back/forward arrive as buttons 4/5.
+        if self.wheel_detent or not sys.platform.startswith('linux'):
+            extra_buttons += [(4, BACK_BUTTON), (5, FORWARD_BUTTON)]
+        extra_buttons += [(8, BACK_BUTTON), (9, FORWARD_BUTTON)]
+        for tk_button, button in extra_buttons:
+            try:
+                self.canvas.bind(f'<ButtonPress-{tk_button}>', lambda event, b=button: self.mouse_down(event, b))
+                self.canvas.bind(f'<B{tk_button}-Motion>', self.mouse_drag)
+                self.canvas.bind(f'<ButtonRelease-{tk_button}>', lambda event, b=button: self.mouse_up(event, b))
+            except tk.TclError:
+                pass  # Older Tk releases accept only buttons 1-5.
         self.canvas.bind('<MouseWheel>', self.mouse_wheel)
+        self.canvas.bind('<Shift-MouseWheel>', lambda event: self.mouse_wheel(event, 1))
         try:
             self.canvas.bind('<TouchpadScroll>', self.touchpad_scroll)
         except tk.TclError:
             pass  # Older Tk releases expose trackpad movement as MouseWheel.
         if sys.platform.startswith('linux'):
-            self.canvas.bind('<Button-4>', lambda event: self.scroll(event, 1))
-            self.canvas.bind('<Button-5>', lambda event: self.scroll(event, -1))
+            self.canvas.bind('<Button-4>', lambda event: self.scroll(event, SCROLL_UNITS))
+            self.canvas.bind('<Button-5>', lambda event: self.scroll(event, -SCROLL_UNITS))
+            self.canvas.bind('<Shift-Button-4>', lambda event: self.scroll(event, -SCROLL_UNITS, 1))
+            self.canvas.bind('<Shift-Button-5>', lambda event: self.scroll(event, SCROLL_UNITS, 1))
+            for tk_button, units in ((6, -SCROLL_UNITS), (7, SCROLL_UNITS)):
+                try:
+                    self.canvas.bind(f'<Button-{tk_button}>', lambda event, u=units: self.scroll(event, u, 1))
+                except tk.TclError:
+                    pass
         self.canvas.bind('<KeyPress>', self.key_down)
         self.canvas.bind('<KeyRelease>', self.key_up)
         self.canvas.bind('<FocusOut>', self.focus_out)
@@ -186,6 +261,7 @@ class App:
         root.bind('<Leave>', self.toolbar_leave, add='+')
         root.protocol('WM_DELETE_WINDOW', self.close)
         self.refresh()
+        self.auto_connect()
         root.after(50, self.poll)
         root.after(33, self.poll_video)
 
@@ -238,10 +314,18 @@ class App:
             if self.ports is not None:
                 self.ports['values'] = ports
             if ports and self.port.get() not in ports:
+                last = load_settings().get('last_port')
                 esp = next((p.device for p in found if p.vid == 0x303A), None)
-                self.port.set(esp or ports[0])
+                self.port.set(last if last in ports else esp or ports[0])
         except ImportError:
             self.status.set('pyserial 설치 필요: pip install -r desktop/requirements.txt')
+
+    def auto_connect(self):
+        """Reconnects to the previously used USB port when it is present at launch."""
+        last = load_settings().get('last_port')
+        if last and last in self.port_values and not self.link:
+            self.port.set(last)
+            self.toggle()
 
     def open_settings(self):
         if self.settings_window is not None and self.settings_window.winfo_exists():
@@ -261,6 +345,8 @@ class App:
         self.connect_button = ttk.Button(row, text='연결 끊기' if self.link else '연결', command=self.toggle)
         self.connect_button.pack(side='left', padx=(6, 0))
         ttk.Button(row, text='Bluetooth 복구', command=self.recover_bluetooth).pack(side='left', padx=(6, 0))
+        self.update_hires_status()
+        ttk.Label(frame, textvariable=self.hires_status, wraplength=450).pack(anchor='w', pady=(0, 8))
         row = ttk.Frame(frame)
         row.pack(fill='x', pady=(0, 12))
         ttk.Label(row, text='영상 캡처').pack(side='left')
@@ -515,6 +601,27 @@ class App:
         if self.connect_button is not None:
             self.connect_button.configure(text=text)
 
+    def set_peer(self, peer):
+        self.peer = peer
+        label = peer_label(peer)
+        self.root.title(f'ESP32 Remote Input — {label}' if label else 'ESP32 Remote Input')
+
+    def update_hires_status(self):
+        if not self.link:
+            text = 'USB 연결 후 확인'
+        elif not self.ble:
+            text = '대상 연결 후 확인'
+        elif self.hires is None:
+            text = '펌웨어가 지원하지 않음'
+        else:
+            wheel, pan = ('켜짐' if on else '꺼짐 (한 칸 단위)' for on in self.hires)
+            text = f'세로 {wheel} · 가로 {pan}'
+        self.hires_status.set('고해상도 휠: ' + text)
+
+    def connected_status(self):
+        label = peer_label(self.peer)
+        return f'연결됨: {label}' if label else '대상 연결됨'
+
     def recover_bluetooth(self):
         if not self.link:
             messagebox.showerror('Bluetooth 복구', '먼저 ESP32의 USB 포트를 연결하세요.')
@@ -522,7 +629,7 @@ class App:
         self.send('ble_recover')
         self.status.set('Bluetooth 연결 복구 요청됨')
 
-    def system_action(self, usage, modifiers=5):
+    def target_command(self, command):
         # Toolbar actions should not leave keyboard control on the button.
         self.root.after_idle(self.canvas.focus_set)
         self.note_activity()
@@ -531,17 +638,13 @@ class App:
                 self.status.set('대상 Bluetooth 연결이 필요합니다')
             return
         self.reset_input()
-        self.send('shortcut %d %d' % (modifiers, usage))
+        self.send(command)
+
+    def system_action(self, usage, modifiers=5):
+        self.target_command('shortcut %d %d' % (modifiers, usage))
 
     def expose(self):
-        self.root.after_idle(self.canvas.focus_set)
-        self.note_activity()
-        if not (self.link and self.ble):
-            if not self.sleeping:
-                self.status.set('대상 Bluetooth 연결이 필요합니다')
-            return
-        self.reset_input()
-        self.send('expose')
+        self.target_command('expose')
 
     def toggle(self):
         if self.link:
@@ -549,6 +652,9 @@ class App:
             self.link.close()
             self.link = None
             self.ble = False
+            self.hires = None
+            self.set_peer(None)
+            self.update_hires_status()
             self.set_connect_label('연결')
             self.status.set('USB 연결 전')
             return
@@ -557,6 +663,7 @@ class App:
             messagebox.showerror('연결', 'USB 시리얼 포트를 선택하세요.')
             return
         self.link = SerialTransport(port, self.events)
+        save_settings({'last_port': port})
         self.link_error = None
         self.sleeping = False
         self.last_activity = time.monotonic()
@@ -630,7 +737,7 @@ class App:
             self.send('release')
         self.dragging = False
         self.drag_button = None
-        self.scroll_remainder = 0
+        self.scroll_remainder = [0.0, 0.0]
         self.language_key_down = False
         self.home_key_down = False
         self.keys.clear()
@@ -681,7 +788,8 @@ class App:
             xy = normalized(event.x, event.y, self.rect)
             if xy is not None:
                 self.send('prepare %d %d' % xy)
-                self.send('down %d %d %d' % (*xy, button + (2 if self.alternate_click.get() else 0)))
+                firmware_button = button if button > 2 else button + (2 if self.alternate_click.get() else 0)
+                self.send('down %d %d %d' % (*xy, firmware_button))
                 self.dragging = True
                 self.drag_button = button
         return 'break'
@@ -704,34 +812,48 @@ class App:
             self.drag_button = None
         return 'break'
 
-    def mouse_wheel(self, event):
-        delta = event.delta
-        if delta:
-            steps = max(1, abs(int(delta)) // 120) if sys.platform == 'win32' else max(1, abs(int(delta)))
-            self.scroll(event, min(127, steps) * (1 if delta > 0 else -1))
+    def mouse_wheel(self, event, axis=0):
+        delta = int(event.delta)
+        if not delta:
+            return 'break'
+        # Wheel up scrolls up; with Shift (or a tilt wheel) it scrolls left.
+        sign = 1 if axis == 0 else -1
+        if self.wheel_detent:
+            # Precision touchpads send fractions of a detent; keep them for high-resolution scrolling.
+            self.accumulate_scroll(event, sign * delta, self.wheel_detent, axis)
+        else:
+            self.scroll(event, sign * (1 if delta > 0 else -1) * max(1, abs(delta)) * SCROLL_UNITS, axis)
         return 'break'
+
+    def accumulate_scroll(self, event, delta, per_detent, axis):
+        self.inside = self.is_inside(event.x, event.y)
+        if not self.active():
+            self.scroll_remainder[axis] = 0.0
+            return
+        self.scroll_remainder[axis] += delta * SCROLL_UNITS / per_detent
+        units = int(self.scroll_remainder[axis])
+        if units:
+            self.scroll_remainder[axis] -= units
+            self.scroll(event, units, axis)
 
     def touchpad_scroll(self, event):
         self.inside = self.is_inside(event.x, event.y)
         if self.controlling():
             self.note_activity()
-        if not self.active():
-            self.scroll_remainder = 0
-            return 'break'
-        self.scroll_remainder -= touchpad_vertical_delta(event.delta)
-        steps = int(self.scroll_remainder / 30)
-        if steps:
-            steps = max(-127, min(127, steps))
-            self.scroll_remainder -= steps * 30
-            self.scroll(event, steps)
+        self.accumulate_scroll(event, -touchpad_vertical_delta(event.delta), TOUCHPAD_DETENT, 0)
+        self.accumulate_scroll(event, touchpad_horizontal_delta(event.delta), TOUCHPAD_DETENT, 1)
         return 'break'
 
-    def scroll(self, event, steps):
+    def scroll(self, event, units, axis=0):
+        """Scroll in 1/8-detent units: axis 0 positive is up, axis 1 positive is right."""
         self.inside = self.is_inside(event.x, event.y)
         if self.controlling():
             self.note_activity()
         if self.active():
-            self.send('scroll %d %d' % (1 if steps > 0 else 0, abs(steps)))
+            while units:
+                chunk = max(-MAX_SCROLL_UNITS, min(MAX_SCROLL_UNITS, units))
+                self.send('smooth %d %d %d' % (axis, 1 if chunk > 0 else 0, abs(chunk)))
+                units -= chunk
         return 'break'
 
     def key_down(self, event):
@@ -783,9 +905,23 @@ class App:
                 if kind == 'ble':
                     if self.ble and not value:
                         self.reset_input()
+                    if value and not self.ble:
+                        # The firmware also announces the name when it finishes reading it.
+                        self.send('peer')
+                    elif not value:
+                        self.set_peer(None)
                     if not self.sleeping:
-                        self.status.set('대상 연결됨' if value else '대상 Bluetooth 연결 대기')
+                        self.status.set(self.connected_status() if value else '대상 Bluetooth 연결 대기')
                     self.ble = value
+                    self.update_hires_status()
+                elif kind == 'hires':
+                    if value != self.hires:
+                        self.hires = value
+                        self.update_hires_status()
+                elif kind == 'peer':
+                    self.set_peer(value)
+                    if self.ble and not self.sleeping:
+                        self.status.set(self.connected_status())
                 elif kind == 'sleep':
                     if value != self.sleeping and time.monotonic() - self.sleep_changed_at >= SLEEP_REPORT_GRACE:
                         self.sleeping = value
@@ -803,6 +939,9 @@ class App:
                 elif kind == 'serial' and value == 'disconnected' and self.link:
                     self.link = None
                     self.ble = False
+                    self.hires = None
+                    self.set_peer(None)
+                    self.update_hires_status()
                     self.dragging = False
                     self.keys.clear()
                     self.set_connect_label('연결')

@@ -1,6 +1,7 @@
 """Serial I/O stays off the GUI thread and preserves input event ordering."""
 import collections
 import os
+import re
 import sys
 import threading
 import time
@@ -11,7 +12,32 @@ LOG_PATH = Path(os.environ.get('REMOTE_INPUT_LOG') or (
     else Path.home() / '.esp32_remote_mouse.log'))
 LOG_LIMIT = 1_000_000
 # Firmware lines worth keeping for link diagnosis; repeated status polls are logged only on change.
-LOG_PREFIXES = ('BLE ', 'READY', 'ADVERTISING', 'SLEEPING', 'AWAKE', 'INPUT_TIMEOUT', 'ERR', 'ESP-ROM', 'rst:', 'waiting for download')
+LOG_PREFIXES = ('BLE ', 'PEER ', 'READY', 'ADVERTISING', 'SLEEPING', 'AWAKE', 'INPUT_TIMEOUT', 'ERR', 'ESP-ROM', 'rst:', 'waiting for download')
+
+PEER_FIELD = re.compile(r'(\w+)="([^"]*)"')
+
+def parse_peer(line):
+    """Returns the target's identity fields from a PEER line, or None when it is unknown."""
+    fields = {key: value.strip() for key, value in PEER_FIELD.findall(line)}
+    return fields if any(fields.values()) else None
+
+HI_RES_FIELD = re.compile(r' (wheel|pan)_hires=(\d)')
+
+def parse_hires(line):
+    """Returns (wheel, pan) high-resolution flags from a status line, or None for older firmware."""
+    flags = dict(HI_RES_FIELD.findall(line))
+    if 'wheel' not in flags or 'pan' not in flags:
+        return None
+    return flags['wheel'] == '1', flags['pan'] == '1'
+
+def peer_label(peer):
+    if not peer:
+        return ''
+    name, model = peer.get('name', ''), peer.get('model', '')
+    detail = model or peer.get('manufacturer', '')
+    if name and detail and detail not in name:
+        return f'{name} ({detail})'
+    return name or detail
 
 class LinkLog:
     """Appends link events with timestamps so a failed reconnect can be traced afterwards."""
@@ -91,6 +117,11 @@ class SerialTransport:
                             self.events.put((self, 'ble', line.startswith('CONNECTED')))
                             if ' sleeping=' in line:
                                 self.events.put((self, 'sleep', ' sleeping=1' in line))
+                            hires = parse_hires(line)
+                            if hires is not None:
+                                self.events.put((self, 'hires', hires))
+                        elif line.startswith('PEER '):
+                            self.events.put((self, 'peer', parse_peer(line)))
                         elif line == 'ERR not connected':
                             self.events.put((self, 'ble', False))
                         elif line in ('SLEEPING', 'AWAKE'):
