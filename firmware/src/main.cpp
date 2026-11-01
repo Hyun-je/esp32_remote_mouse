@@ -46,13 +46,15 @@ static bool sessionReady = false;
 static bool keysDown = false;
 static uint32_t lastActivity = 0;
 static constexpr uint32_t INPUT_TIMEOUT_MS = 2500;
+// Standby keeps USB serial alive so the desktop can wake it; deep sleep would drop the USB CDC link.
+static bool sleeping = false;
+static constexpr uint32_t AWAKE_CPU_MHZ = 160, SLEEP_CPU_MHZ = 80;  // USB serial needs the 80 MHz PLL.
 
 class Callbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer*) override { connected = true; Serial.println("CONNECTED"); }
   void onDisconnect(NimBLEServer*) override {
     connected = false;
     Serial.println("DISCONNECTED");
-    NimBLEDevice::startAdvertising();
   }
 };
 
@@ -75,6 +77,36 @@ void globe(bool down) {
   globeReport->setValue(data, sizeof(data)); globeReport->notify();
 }
 
+void releaseAll() {
+  pointerDown = false; keysDown = false; relativeButton = false; pointerButton = 0;
+  if (!connected) return;
+  touch(false, lastX, lastY); relativeMouse(0);
+  const uint8_t empty[6] = {}; keyState(0, empty); globe(false);
+}
+// Report a power-off like a keyboard switched off, so the target reconnects when it sees us again.
+void dropPeers() {
+  NimBLEServer *server = NimBLEDevice::getServer();
+  for (uint16_t handle : server->getPeerDevices()) server->disconnect(handle, BLE_ERR_RD_CONN_TERM_PWROFF);
+}
+// Drop the target and stop advertising so the target no longer sees a keyboard and pointer.
+void enterSleep() {
+  if (sleeping) return;
+  releaseAll();
+  sleeping = true;
+  NimBLEDevice::stopAdvertising();
+  dropPeers();
+  setCpuFrequencyMhz(SLEEP_CPU_MHZ);
+  Serial.println("SLEEPING");
+}
+// Advertising again lets the bonded target reconnect on its own.
+void exitSleep() {
+  if (!sleeping) return;
+  setCpuFrequencyMhz(AWAKE_CPU_MHZ);
+  sleeping = false;
+  NimBLEDevice::startAdvertising();
+  Serial.println("AWAKE");
+}
+
 // Parse the entire command; reject negative values, overflow, trailing junk and excess arguments.
 void command(String line) {
   line.trim();
@@ -94,10 +126,43 @@ void command(String line) {
   }
   lastActivity = millis();
   if (!strcmp(op, "status") && count == 0) {
-    Serial.printf("%s touch_subscribers=%u key_subscribers=%u mouse_subscribers=%u\n", connected ? "CONNECTED" : "DISCONNECTED", (unsigned)touchReport->getSubscribedCount(), (unsigned)keyReport->getSubscribedCount(), (unsigned)wheelReport->getSubscribedCount()); return;
+    Serial.printf("%s sleeping=%u advertising=%u bonds=%d touch_subscribers=%u key_subscribers=%u mouse_subscribers=%u\n", connected ? "CONNECTED" : "DISCONNECTED", (unsigned)sleeping, (unsigned)NimBLEDevice::getAdvertising()->isAdvertising(), NimBLEDevice::getNumBonds(), (unsigned)touchReport->getSubscribedCount(), (unsigned)keyReport->getSubscribedCount(), (unsigned)wheelReport->getSubscribedCount()); return;
+  }
+  if (!strcmp(op, "sleep") && count == 0) { enterSleep(); Serial.println("OK"); return; }
+  if (!strcmp(op, "wake") && count == 0) { exitSleep(); Serial.println("OK"); return; }
+  if (!strcmp(op, "ble_recover") && count == 0) {
+    exitSleep();
+    if (connected) { Serial.println("OK already connected"); return; }
+    NimBLEDevice::stopAdvertising();
+    if (NimBLEDevice::startAdvertising()) Serial.println("OK advertising");
+    else Serial.println("ERR advertising failed");
+    return;
+  }
+  // Without a stored peer IRK the iPad's rotating address cannot be matched to its bond.
+  if (!strcmp(op, "bonds") && count == 0) {
+    ble_addr_t peers[MYNEWT_VAL(BLE_STORE_MAX_BONDS)];
+    int peerCount = 0;
+    ble_store_util_bonded_peers(peers, &peerCount, MYNEWT_VAL(BLE_STORE_MAX_BONDS));
+    for (int i = 0; i < peerCount; ++i) {
+      ble_store_key_sec key = {};
+      ble_store_value_sec value = {};
+      key.peer_addr = peers[i];
+      const int rc = ble_store_read_peer_sec(&key, &value);
+      Serial.printf("BLE bond %d addr=%s type=%u rc=%d irk=%u ltk=%u sc=%u authenticated=%u\n", i,
+                    NimBLEAddress(key.peer_addr).toString().c_str(), key.peer_addr.type, rc,
+                    value.irk_present, value.ltk_present, value.sc, value.authenticated);
+    }
+    Serial.println("OK"); return;
+  }
+  // A bond without the peer IRK cannot be repaired in place; drop it so the target pairs again.
+  if (!strcmp(op, "unpair") && count == 0) {
+    NimBLEServer *server = NimBLEDevice::getServer();
+    for (uint16_t handle : server->getPeerDevices()) server->disconnect(handle);
+    NimBLEDevice::deleteAllBonds();
+    Serial.printf("OK bonds=%d\n", NimBLEDevice::getNumBonds()); return;
   }
   if (!strcmp(op, "help") && count == 0) {
-    Serial.println("status | goto X Y | prepare X Y | down X Y [BUTTON] | move X Y | up | scroll DIRECTION STEPS | keys MOD [USAGE ...] | shortcut MOD USAGE | expose | release"); return;
+    Serial.println("status | bonds | unpair | ble_recover | sleep | wake | goto X Y | prepare X Y | down X Y [BUTTON] | move X Y | up | scroll DIRECTION STEPS | keys MOD [USAGE ...] | shortcut MOD USAGE | expose | release"); return;
   }
   if (!connected || !sessionReady) { Serial.println("ERR not connected"); return; }
   // Keep shortcut press and release ordered even if serial output is delayed.
@@ -173,12 +238,43 @@ void command(String line) {
   }
   Serial.println("ERR invalid command");
 }
+// Trace each link stage so a failed reconnect shows where it stopped.
+static int logGap(ble_gap_event *event, void *) {
+  ble_gap_conn_desc desc;
+  switch (event->type) {
+    case BLE_GAP_EVENT_CONNECT:
+      if (!event->connect.status && !ble_gap_conn_find(event->connect.conn_handle, &desc))
+        Serial.printf("BLE connect peer=%s type=%u ota=%s type=%u\n", NimBLEAddress(desc.peer_id_addr).toString().c_str(), desc.peer_id_addr.type,
+                      NimBLEAddress(desc.peer_ota_addr).toString().c_str(), desc.peer_ota_addr.type);
+      else Serial.printf("BLE connect failed status=%d\n", event->connect.status);
+      break;
+    case BLE_GAP_EVENT_DISCONNECT:
+      Serial.printf("BLE disconnect reason=0x%x\n", event->disconnect.reason); break;
+    case BLE_GAP_EVENT_ENC_CHANGE:
+      if (!ble_gap_conn_find(event->enc_change.conn_handle, &desc))
+        Serial.printf("BLE encryption status=%d encrypted=%u bonded=%u\n", event->enc_change.status, desc.sec_state.encrypted, desc.sec_state.bonded);
+      else Serial.printf("BLE encryption status=%d\n", event->enc_change.status);
+      break;
+    case BLE_GAP_EVENT_REPEAT_PAIRING: Serial.println("BLE repeat pairing"); break;
+    case BLE_GAP_EVENT_SUBSCRIBE:
+      Serial.printf("BLE subscribe handle=%u notify=%u\n", event->subscribe.attr_handle, event->subscribe.cur_notify); break;
+    case BLE_GAP_EVENT_ADV_COMPLETE:
+      Serial.printf("BLE advertising complete reason=%d\n", event->adv_complete.reason); break;
+  }
+  return 0;
+}
 void setup() {
   Serial.begin(115200);
   NimBLEDevice::init("ESP32 Remote Input");
+  NimBLEDevice::setCustomGapHandler(logGap);
   NimBLEDevice::setSecurityAuth(true, false, true);
+  // iOS reconnects from a rotating private address; both sides exchange identity keys so the bond can follow it.
+  NimBLEDevice::setSecurityInitKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
+  NimBLEDevice::setSecurityRespKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
   NimBLEServer *server = NimBLEDevice::createServer();
   server->setCallbacks(new Callbacks());
+  // loop() restarts advertising; NimBLE's own restart would ignore standby and invite a reconnect loop.
+  server->advertiseOnDisconnect(false);
   auto *hid = new NimBLEHIDDevice(server);
   keyReport = hid->inputReport(2);
   hid->outputReport(2);
@@ -199,6 +295,17 @@ void setup() {
 void loop() {
   static String line;
   static bool overflow = false;
+  static uint32_t lastAdvertisingCheck = 0;
+  // A target that connected just before advertising stopped is dropped too.
+  static uint32_t lastSleepDrop = 0;
+  if (sleeping && connected && millis() - lastSleepDrop >= 500) {
+    lastSleepDrop = millis();
+    dropPeers();
+  }
+  if (!sleeping && !connected && !NimBLEDevice::getAdvertising()->isAdvertising() && millis() - lastAdvertisingCheck >= 1000) {
+    lastAdvertisingCheck = millis();
+    if (NimBLEDevice::startAdvertising()) Serial.println("ADVERTISING");
+  }
   // A reconnect must never replay a previously pressed button or key.
   if (!connected) {
     sessionReady = false;
@@ -227,5 +334,5 @@ void loop() {
     } else if (!overflow && line.length() < 80) line += c;
     else overflow = true;
   }
-  delay(2);
+  delay(sleeping ? 10 : 2);
 }

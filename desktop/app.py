@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Focused-window remote control for an ESP32 BLE HID bridge."""
+import json
+import os
 import queue
 import sys
 import threading
 import time
+from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -11,6 +14,13 @@ from keymap import KeyState, usage_from_event
 from mac_shortcuts import MacHideShortcut
 from transport import SerialTransport
 from video_capture import CaptureError, VideoCapture, list_devices, list_resolutions, list_frame_rates
+
+DEFAULT_IDLE_MINUTES = 5
+SETTINGS_PATH = Path(os.environ.get('REMOTE_INPUT_SETTINGS') or (
+    Path.home() / 'Library' / 'Application Support' / 'esp32_remote_mouse' / 'settings.json'
+    if sys.platform == 'darwin' else Path.home() / '.esp32_remote_mouse.json'))
+# Firmware status lines already in flight may predate a sleep or wake request.
+SLEEP_REPORT_GRACE = 1.5
 
 
 def content_rect(width, height, target_width, target_height):
@@ -29,6 +39,37 @@ def normalized(x, y, rect):
     nx = min(1, max(0, (x - left) / (width - 1)))
     ny = min(1, max(0, (y - top) / (height - 1)))
     return round(nx * 10000), round(ny * 10000)
+
+
+def valid_idle_minutes(value):
+    minutes = float(value)
+    if not 0 <= minutes <= 1440:
+        raise ValueError(value)
+    return minutes
+
+
+def load_settings(path=None):
+    try:
+        with open(path or SETTINGS_PATH, encoding='utf-8') as file:
+            data = json.load(file)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(changes, path=None):
+    """Merge changes into the stored settings; a write failure only loses persistence."""
+    path = Path(path or SETTINGS_PATH)
+    data = load_settings(path)
+    data.update(changes)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix('.tmp')
+        temporary.write_text(json.dumps(data, indent=2), encoding='utf-8')
+        temporary.replace(path)
+        return True
+    except OSError:
+        return False
 
 
 def touchpad_vertical_delta(packed):
@@ -93,6 +134,14 @@ class App:
         self.connect_button = None
         self.port_values = []
         self.fullscreen = False
+        try:
+            self.idle_minutes = valid_idle_minutes(load_settings().get('idle_minutes', DEFAULT_IDLE_MINUTES))
+        except (TypeError, ValueError):
+            self.idle_minutes = DEFAULT_IDLE_MINUTES
+        self.idle_choice = tk.StringVar(value=f'{self.idle_minutes:g}')
+        self.last_activity = time.monotonic()
+        self.sleeping = False
+        self.sleep_changed_at = 0.0
 
         self.canvas = tk.Canvas(root, bg='#181c22', highlightthickness=0,
                                 borderwidth=0, takefocus=True)
@@ -211,6 +260,7 @@ class App:
         ttk.Button(row, text='새로고침', command=self.refresh).pack(side='left')
         self.connect_button = ttk.Button(row, text='연결 끊기' if self.link else '연결', command=self.toggle)
         self.connect_button.pack(side='left', padx=(6, 0))
+        ttk.Button(row, text='Bluetooth 복구', command=self.recover_bluetooth).pack(side='left', padx=(6, 0))
         row = ttk.Frame(frame)
         row.pack(fill='x', pady=(0, 12))
         ttk.Label(row, text='영상 캡처').pack(side='left')
@@ -247,6 +297,14 @@ class App:
         apply_button.pack(side='left', padx=6)
         self.resolution_controls = [width_entry, height_entry, apply_button]
         self.set_resolution_state()
+        row = ttk.Frame(frame)
+        row.pack(fill='x', pady=(0, 4))
+        ttk.Label(row, text='자동 절전').pack(side='left')
+        ttk.Entry(row, width=6, textvariable=self.idle_choice).pack(side='left', padx=(6, 2))
+        ttk.Label(row, text='분').pack(side='left')
+        ttk.Button(row, text='적용', command=self.apply_idle_timeout).pack(side='left', padx=6)
+        ttk.Label(frame, text='제어 영역에서 입력이 없으면 Bluetooth를 끊고 ESP32를 절전 상태로 둡니다. 0은 사용 안 함.',
+                  wraplength=450).pack(anchor='w')
         ttk.Checkbutton(frame, text='상대 마우스로 클릭 (iPad 권장)', variable=self.alternate_click).pack(anchor='w', pady=(12, 0))
         ttk.Checkbutton(frame, text='Caps Lock으로 iPad 입력 언어 전환', variable=self.caps_language).pack(anchor='w')
         ttk.Checkbutton(frame, text='항상 위에 표시', variable=self.always_on_top,
@@ -263,6 +321,38 @@ class App:
         window.protocol('WM_DELETE_WINDOW', close_settings)
         self.refresh()
         self.refresh_capture_devices()
+
+    def apply_idle_timeout(self):
+        try:
+            minutes = valid_idle_minutes(self.idle_choice.get())
+        except ValueError:
+            messagebox.showerror('자동 절전', '0부터 1440까지의 분을 입력하세요. 0은 사용 안 함입니다.')
+            self.idle_choice.set(f'{self.idle_minutes:g}')
+            return
+        self.idle_minutes = minutes
+        self.idle_choice.set(f'{minutes:g}')
+        self.last_activity = time.monotonic()
+        if not save_settings({'idle_minutes': minutes}):
+            self.status.set('자동 절전 설정을 저장하지 못했습니다')
+
+    def note_activity(self):
+        """Input in the control area restarts the idle timer and wakes a sleeping ESP32."""
+        self.last_activity = time.monotonic()
+        if self.sleeping and self.link:
+            self.sleeping = False
+            self.sleep_changed_at = self.last_activity
+            self.send('wake')
+            self.status.set('절전 해제: 대상 Bluetooth 재연결 대기')
+
+    def check_idle(self, now=None):
+        now = time.monotonic() if now is None else now
+        if (self.link and not self.sleeping and self.idle_minutes > 0
+                and now - self.last_activity >= self.idle_minutes * 60):
+            self.reset_input()
+            self.sleeping = True
+            self.sleep_changed_at = now
+            self.send('sleep')
+            self.status.set('절전 모드: 제어 영역에서 조작하면 다시 연결합니다')
 
     def set_resolution_state(self):
         for control in self.resolution_controls:
@@ -425,19 +515,30 @@ class App:
         if self.connect_button is not None:
             self.connect_button.configure(text=text)
 
+    def recover_bluetooth(self):
+        if not self.link:
+            messagebox.showerror('Bluetooth 복구', '먼저 ESP32의 USB 포트를 연결하세요.')
+            return
+        self.send('ble_recover')
+        self.status.set('Bluetooth 연결 복구 요청됨')
+
     def system_action(self, usage, modifiers=5):
         # Toolbar actions should not leave keyboard control on the button.
         self.root.after_idle(self.canvas.focus_set)
+        self.note_activity()
         if not (self.link and self.ble):
-            self.status.set('대상 Bluetooth 연결이 필요합니다')
+            if not self.sleeping:
+                self.status.set('대상 Bluetooth 연결이 필요합니다')
             return
         self.reset_input()
         self.send('shortcut %d %d' % (modifiers, usage))
 
     def expose(self):
         self.root.after_idle(self.canvas.focus_set)
+        self.note_activity()
         if not (self.link and self.ble):
-            self.status.set('대상 Bluetooth 연결이 필요합니다')
+            if not self.sleeping:
+                self.status.set('대상 Bluetooth 연결이 필요합니다')
             return
         self.reset_input()
         self.send('expose')
@@ -457,6 +558,8 @@ class App:
             return
         self.link = SerialTransport(port, self.events)
         self.link_error = None
+        self.sleeping = False
+        self.last_activity = time.monotonic()
         self.set_connect_label('연결 끊기')
         self.status.set('USB 연결 중…')
 
@@ -512,6 +615,10 @@ class App:
     def active(self):
         return bool(self.link and self.ble and self.inside and self.has_focus())
 
+    def controlling(self):
+        """Like active(), but also true while Bluetooth is down so input can wake the ESP32."""
+        return bool(self.link and self.inside and self.has_focus())
+
     def send(self, text):
         if self.link:
             self.link.send(text)
@@ -543,7 +650,10 @@ class App:
         if was_inside and not self.inside:
             self.mac_hide.set_active(False)
             self.reset_input()
-        elif self.inside and not self.dragging and self.active():
+            return
+        if self.controlling():
+            self.note_activity()
+        if self.inside and not self.dragging and self.active():
             self.mac_hide.set_active(True)
             xy = normalized(event.x, event.y, self.rect)
             if xy is not None:
@@ -565,6 +675,8 @@ class App:
         self.inside = self.is_inside(event.x, event.y)
         focused = self.has_focus()
         self.canvas.focus_set()
+        if self.link and self.inside:
+            self.note_activity()
         if focused and self.active() and not self.dragging:
             xy = normalized(event.x, event.y, self.rect)
             if xy is not None:
@@ -579,6 +691,7 @@ class App:
         if not self.inside:
             self.reset_input()
         elif self.dragging and self.active():
+            self.note_activity()
             xy = normalized(event.x, event.y, self.rect)
             if xy is not None:
                 self.send('move %d %d' % xy)
@@ -600,6 +713,8 @@ class App:
 
     def touchpad_scroll(self, event):
         self.inside = self.is_inside(event.x, event.y)
+        if self.controlling():
+            self.note_activity()
         if not self.active():
             self.scroll_remainder = 0
             return 'break'
@@ -613,12 +728,16 @@ class App:
 
     def scroll(self, event, steps):
         self.inside = self.is_inside(event.x, event.y)
+        if self.controlling():
+            self.note_activity()
         if self.active():
             self.send('scroll %d %d' % (1 if steps > 0 else 0, abs(steps)))
         return 'break'
 
     def key_down(self, event):
         usage = usage_from_event(event, self.root.tk.call("info", "patchlevel"))
+        if self.controlling():
+            self.note_activity()
         if (sys.platform != 'darwin' and usage == 11 and self.active()
                 and any(u in self.keys.held for u in (224, 228))
                 and all(u in (224, 228) for u in self.keys.held)):
@@ -664,8 +783,16 @@ class App:
                 if kind == 'ble':
                     if self.ble and not value:
                         self.reset_input()
+                    if not self.sleeping:
+                        self.status.set('대상 연결됨' if value else '대상 Bluetooth 연결 대기')
                     self.ble = value
-                    self.status.set('대상 연결됨' if value else '대상 Bluetooth 연결 대기')
+                elif kind == 'sleep':
+                    if value != self.sleeping and time.monotonic() - self.sleep_changed_at >= SLEEP_REPORT_GRACE:
+                        self.sleeping = value
+                        if value:
+                            self.reset_input()
+                        self.status.set('절전 모드: 제어 영역에서 조작하면 다시 연결합니다' if value
+                                        else '대상 Bluetooth 연결 대기')
                 elif kind == 'input_timeout':
                     self.dragging = False
                     self.keys.clear()
@@ -682,6 +809,7 @@ class App:
                     self.status.set('오류: ' + self.link_error if self.link_error else 'USB 연결 끊김')
         except queue.Empty:
             pass
+        self.check_idle()
         self.root.after(50, self.poll)
 
     def close(self):

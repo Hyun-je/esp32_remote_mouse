@@ -18,5 +18,7 @@ After flashing and pairing `ESP32 Remote Input`, open the serial monitor at 1152
 - `key 0 0`: release keys
 - `keys 2 4 5`: hold left Shift and HID usages 4 and 5 simultaneously (up to six keys); `keys 0` releases all keys. Each command replaces the entire keyboard state.
 - `release`: release the pointer button and keys
+- `sleep`: release inputs, disconnect the target, stop advertising and lower the CPU clock; prints `SLEEPING`
+- `wake`: restore the CPU clock and resume advertising so the bonded target can reconnect; prints `AWAKE`. `ble_recover` also wakes.
 
 Only send test input while the target device is ready to receive it. On one iPad with AssistiveTouch enabled, BLE keyboard input, absolute pointer movement, and a drag drawing a line in Notes were observed. iPad model, OS version, click accuracy, reconnect behavior, and other hosts remain unverified. A successful serial `OK` confirms command handling, not that the host accepted or acted on a report. `move` requires a preceding `down`; `up` and `release` clear the button. On each BLE reconnect, the firmware sends a neutral keyboard and pointer state once both reports are subscribed. While a key or button is held, send `status` or another command at least every 2.5 seconds: the firmware releases inputs on timeout and emits `INPUT_TIMEOUT`. The desktop app polls every second.
