@@ -66,6 +66,7 @@ def list_devices():
     devices = []
     if sys.platform == 'darwin':
         video_section = False
+        found = []
         for line in output.splitlines():
             if 'AVFoundation video devices:' in line:
                 video_section = True
@@ -74,8 +75,14 @@ def list_devices():
             elif video_section:
                 match = re.search(r'\[(\d+)\]\s+(.+)$', line)
                 if match:
-                    index, name = match.groups()
-                    devices.append(CaptureDevice(name.strip(), 'avfoundation', f'{index}:none'))
+                    found.append(match.groups())
+        # Indexes shift when cameras (e.g. a Continuity Camera iPhone) come and
+        # go, which would open the wrong device. Address unique names directly.
+        names = [name.strip() for _, name in found]
+        for index, name in found:
+            name = name.strip()
+            by_name = names.count(name) == 1 and ':' not in name
+            devices.append(CaptureDevice(name, 'avfoundation', f'{name}:none' if by_name else f'{index}:none'))
         if 'AVFoundation video devices:' not in output:
             raise CaptureError('비디오 장치 검색 실패: ' + output.strip()[-500:])
     else:
@@ -260,7 +267,9 @@ class VideoCapture:
             if not acquired or self._stopped.is_set():
                 return
             executable = _ffmpeg()
-            args = [executable, '-hide_banner', '-loglevel', 'error', '-f', self.device.format]
+            args = [executable, '-hide_banner', '-loglevel', 'error',
+                    '-fflags', 'nobuffer', '-flags', 'low_delay', '-probesize', '32', '-analyzeduration', '0',
+                    '-f', self.device.format]
             # AVFoundation defaults to 30000/1001, which some Mac cameras reject.
             if self.fps is not None:
                 args.extend(['-framerate', str(self.fps)])
@@ -270,9 +279,20 @@ class VideoCapture:
                 args.extend(['-framerate', str(rate)])
             if self.source_size:
                 args.extend(['-video_size', f'{self.source_size[0]}x{self.source_size[1]}'])
-            args += ['-i', self.device.source, '-an', '-vf',
-                    f'scale={self.width}:{self.height}:force_original_aspect_ratio=decrease',
-                    '-fps_mode', 'passthrough', '-pix_fmt', 'rgb24', '-c:v', 'ppm', '-f', 'image2pipe', 'pipe:1']
+            # With a known source size the output size is computed here, so raw
+            # RGB frames need no per-frame header; otherwise fall back to PPM.
+            raw_size = None
+            if self.source_size:
+                sw, sh = self.source_size
+                ratio = min(self.width / sw, self.height / sh)
+                raw_size = (max(1, int(sw * ratio)), max(1, int(sh * ratio)))
+                scale = f'scale={raw_size[0]}:{raw_size[1]}:flags=fast_bilinear'
+                codec = ['-c:v', 'rawvideo', '-f', 'rawvideo']
+            else:
+                scale = f'scale={self.width}:{self.height}:force_original_aspect_ratio=decrease:flags=fast_bilinear'
+                codec = ['-c:v', 'ppm', '-f', 'image2pipe']
+            args += ['-i', self.device.source, '-an', '-vf', scale,
+                     '-fps_mode', 'passthrough', '-pix_fmt', 'rgb24', *codec, 'pipe:1']
             if self._stopped.is_set():
                 return
             process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -283,6 +303,13 @@ class VideoCapture:
             stderr_thread.start()
             if self._stopped.is_set():
                 process.terminate()
+            while not self._stopped.is_set() and raw_size:
+                width, height = raw_size
+                pixels = self._read_exact(process.stdout, width * height * 3)
+                frame = (width, height, f'P6\n{width} {height}\n255\n'.encode('ascii') + pixels)
+                with self._lock:
+                    if not self._stopped.is_set():
+                        self._frame = frame
             while not self._stopped.is_set():
                 magic = self._token(process.stdout)
                 width = int(self._token(process.stdout))

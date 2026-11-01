@@ -569,7 +569,7 @@ class App:
                 now = time.monotonic()
                 self.last_video_frame = now
                 if self.capture_photo and now < self.next_video_draw_at:
-                    self.root.after(33, self.poll_video)
+                    self.root.after(8, self.poll_video)
                     return
                 try:
                     new_geometry = self.capture_photo is None or self.size != (width, height)
@@ -578,7 +578,7 @@ class App:
                         self.capture_photo = tk.PhotoImage(data=data, format='PPM')
                     else:
                         self.capture_photo.configure(data=data, format='PPM')
-                    self.next_video_draw_at = now + (0.2 if self.settings_window is not None else 1 / 30)
+                    self.next_video_draw_at = now + (0.025 if self.settings_window is not None else 0)
                     if new_geometry:
                         self.capture_status.set(f'영상 표시 중 · {width} × {height}')
                         self.redraw()
@@ -595,7 +595,8 @@ class App:
                 self.reset_input()
                 self.capture_photo = None
                 self.redraw()
-        self.root.after(33, self.poll_video)
+        # Poll faster than the camera frame interval so frames are shown as they arrive.
+        self.root.after(8 if self.capture else 33, self.poll_video)
 
     def set_connect_label(self, text):
         if self.connect_button is not None:
